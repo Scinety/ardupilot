@@ -1,0 +1,33 @@
+name: Build Rover
+
+on:
+  workflow_dispatch:
+    inputs:
+      board:
+        description: 'Board name'
+        required: true
+        default: 'MicoAir743v2'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi
+          
+      - name: Build Rover
+        run: |
+          ./waf configure --board ${{ github.event.inputs.board }}
+          ./waf rover
+          
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: ardurover-${{ github.event.inputs.board }}
+          path: build/${{ github.event.inputs.board }}/bin/ardurover.apj

@@ -20,11 +20,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi
+          pip3 install empy==3.3.4 pexpect future
           
       - name: Build Rover
         run: |
-          ./waf configure --board ${{ github.event.inputs.board }}
-          ./waf rover
+          python3 waf configure --board ${{ github.event.inputs.board }}
+          python3 waf rover
           
       - name: Upload firmware
         uses: actions/upload-artifact@v4

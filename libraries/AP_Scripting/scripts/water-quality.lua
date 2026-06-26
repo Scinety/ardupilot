@@ -2,6 +2,7 @@ local PARAM_TABLE_KEY    = 26
 local PARAM_TABLE_PREFIX = "WQ_"
 local port               = serial:find_serial(0)
 assert(port, 'No scripting serial port found!')
+
 -- ============================================
 -- 参数化配置
 -- ============================================
@@ -9,33 +10,39 @@ local function add_param(name, idx, default_value)
     assert(param:add_param(PARAM_TABLE_KEY, idx, name, default_value),
         string.format("WQ: could not add param %s", name))
 end
+
 assert(param:add_table(PARAM_TABLE_KEY, PARAM_TABLE_PREFIX, 30), "WQ: could not add param table")
+
 -- 基本参数
 add_param('BAUD',     0, 9600)
 add_param('INTERVAL', 1, 2000)
 add_param('TIMEOUT',  2, 5000)
 add_param('LOG_EN',   3, 1)      -- 启用SD卡日志
+
 -- 报警阈值参数
 add_param('PH_MIN',   4, 6.0)
 add_param('PH_MAX',   5, 9.0)
-add_param('O2_MIN',   6, 5.0)
+add_param('DO_MIN',   6, 5.0)
 add_param('TEMP_MAX', 7, 40.0)
 add_param('NTU_MAX',  8, 500.0)
 add_param('NH3_MAX',  9, 1.5)
+
 -- 读取配置
 local SENSOR_BAUD      = param:get(PARAM_TABLE_PREFIX .. 'BAUD')
 local SEND_INTERVAL_MS = param:get(PARAM_TABLE_PREFIX .. 'INTERVAL')
 local SENSOR_TIMEOUT   = param:get(PARAM_TABLE_PREFIX .. 'TIMEOUT')
 local LOG_ENABLED      = param:get(PARAM_TABLE_PREFIX .. 'LOG_EN') > 0
+
 port:begin(uint32_t(SENSOR_BAUD))
 port:set_flow_control(0)
+
 -- ============================================
 -- 传感器定义
 -- ============================================
 local SENSORS = {
     [0x01] = 'COD',
     [0x02] = 'NH3',
-    [0x03] = 'O2',
+    [0x03] = 'DO',
     [0x04] = 'NTU',
     [0x05] = 'COND',
     [0x06] = 'PH',
@@ -44,13 +51,12 @@ local SENSORS = {
     [0x09] = 'ALGE',
     [0x0A] = 'OIL',
 }
--- 用于表头排序
-local SENSOR_ORDER = {'COD', 'NH3', 'O2', 'NTU', 'COND', 'PH', 'ORP', 'CHLO', 'ALGE', 'OIL'}
+
 -- 扩展参数名称（包括子参数）
 local ALL_COLUMNS = {'time', 'lat', 'lon'}
 -- 从SENSOR_ORDER和RESPONSES中收集所有可能的参数名
 local PARAM_NAMES = {
-    'COD', 'TOC', 'NH3', 'O2', 'SAT', 'NTU', 'COND',
+    'COD', 'TOC', 'NH3', 'DO', 'SAT', 'NTU', 'COND',
     'PH', 'ORP', 'CHLO', 'ALGE', 'OIL', 'TEMP', 'MV'
 }
 
@@ -80,7 +86,7 @@ local RESPONSES = {
     [0x010304] = { 'NTU' },
     [0x020304] = { 'NH3' },
     [0x020308] = { '', 'PH' },
-    [0x03030C] = { 'TEMP', 'SAT', 'O2' },
+    [0x03030C] = { 'TEMP', 'SAT', 'DO' },
     [0x040308] = { 'TEMP', 'NTU' },
     [0x050308] = { 'TEMP', 'COND' },
     [0x060308] = { 'MV', 'PH' },
@@ -98,7 +104,7 @@ local RESPONSES = {
 local VALID_RANGES = {
     PH   = {min=0, max=14},
     TEMP = {min=-10, max=60},
-    O2   = {min=0, max=20},
+    DO   = {min=0, max=20},
     SAT  = {min=0, max=200},
     NTU  = {min=0, max=4000},
     COND = {min=0, max=100000},
@@ -126,10 +132,32 @@ local current_data = {}
 
 -- SD卡日志相关
 local log_file = nil
-local log_file_created = false
-local gps_locked = false
+local current_log_date = nil  -- 当前打开的文件名，用于判断是否需要切换文件
 local last_log_time = 0
 local LOG_INTERVAL_MS = 2000  -- 2秒记录一次
+local gps_was_locked = false   -- GPS锁定状态记忆，用于日志文件切换通知
+
+-- GPS防抖动：短暂丢星不中断日志（位置由AHRS/EKF惯导持续提供）
+local GPS_LOST_TIMEOUT = 10000  -- 连续丢星超过10秒才判定为真正丢失
+local gps_lost_since = 0        -- GPS丢失发生的时刻 (millis，0表示当前有效)
+
+-- 检查GPS是否有有效定位（3D fix）
+local function has_gps_fix()
+    local status = gps:status(0)  -- 主GPS
+    return status and status >= 3  -- 3=3D fix, 4=DGPS, 5=RTK Float, 6=RTK Fixed
+end
+
+-- GPS防抖动门控：丢星≤10秒仍允许记录（AHRS/EKF会用IMU惯导推算位置）
+local function gps_log_ok()
+    if has_gps_fix() then
+        gps_lost_since = 0
+        return true
+    end
+    if gps_lost_since == 0 then
+        gps_lost_since = millis()
+    end
+    return (millis() - gps_lost_since) < GPS_LOST_TIMEOUT
+end
 
 -- ============================================
 -- 工具函数
@@ -218,11 +246,11 @@ local function check_alerts(name, value)
             is_alert = true
             msg = string.format('PH过高: %.1f > %.1f', value, ph_max)
         end
-    elseif name == 'O2' then
-        local o2_min = param:get(PARAM_TABLE_PREFIX .. 'O2_MIN')
-        if value < o2_min then
+    elseif name == 'DO' then
+        local do_min = param:get(PARAM_TABLE_PREFIX .. 'DO_MIN')
+        if value < do_min then
             is_alert = true
-            msg = string.format('溶解氧过低: %.1f < %.1f', value, o2_min)
+            msg = string.format('溶解氧过低: %.1f < %.1f', value, do_min)
         end
     elseif name == 'TEMP' then
         local temp_max = param:get(PARAM_TABLE_PREFIX .. 'TEMP_MAX')
@@ -274,73 +302,78 @@ end
 -- ============================================
 -- SD卡文件日志
 -- ============================================
+
+-- 从unix时间戳转换到年月日 (1970-01-01起算的天数)
+local function unix_to_ymd(unix_seconds)
+    local days = math.floor(unix_seconds / 86400)
+    local y = 1970
+    local m = 1
+    local d = days + 1  -- 从1开始
+
+    local days_in_year = 365
+    while d > days_in_year do
+        d = d - days_in_year
+        y = y + 1
+        if (y % 4 == 0 and y % 100 ~= 0) or (y % 400 == 0) then
+            days_in_year = 366
+        else
+            days_in_year = 365
+        end
+    end
+
+    local days_in_month = {31,28,31,30,31,30,31,31,30,31,30,31}
+    if (y % 4 == 0 and y % 100 ~= 0) or (y % 400 == 0) then
+        days_in_month[2] = 29
+    end
+    while d > days_in_month[m] do
+        d = d - days_in_month[m]
+        m = m + 1
+    end
+    return y, m, d
+end
+
 local function get_utc_time()
     -- 尝试从GPS获取UTC时间
+    -- 注意: GPS周计数器每1024周(约19.7年)溢出一次，最近一次是2019年4月。
+    -- 当前周期到2038年底前都有效。
     local week = gps:time_week()
     local week_ms = gps:time_week_ms()
-    
+
     if week > 0 and week_ms > 0 then
         -- GPS时间可用，转换为UTC
         -- GPS纪元: 1980-01-06 00:00:00 UTC
-        -- 计算从GPS纪元到现在的秒数
+        -- 转为Unix时间戳 (GPS纪元到Unix纪元的偏移: 315964800秒)
         local gps_seconds = week * 604800 + week_ms / 1000
-        
-        -- 转换为Unix时间戳 (GPS纪元到Unix纪元的偏移: 315964800秒)
         local unix_seconds = gps_seconds + 315964800
-        
-        -- 计算日期
-        local days = math.floor(unix_seconds / 86400)
+
         local remaining = unix_seconds % 86400
         local hours = math.floor(remaining / 3600)
         remaining = remaining % 3600
         local mins = math.floor(remaining / 60)
         local secs = remaining % 60
-        
-        -- 计算年月日 (从1970-01-01开始)
-        local y = 1970
-        local m = 1
-        local d = days + 1  -- 从1开始
-        
-        -- 简化的日期计算
-        local days_in_year = 365
-        while d > days_in_year do
-            d = d - days_in_year
-            y = y + 1
-            -- 闰年判断
-            if (y % 4 == 0 and y % 100 ~= 0) or (y % 400 == 0) then
-                days_in_year = 366
-            else
-                days_in_year = 365
-            end
-        end
-        
-        local days_in_month = {31,28,31,30,31,30,31,31,30,31,30,31}
-        if (y % 4 == 0 and y % 100 ~= 0) or (y % 400 == 0) then
-            days_in_month[2] = 29
-        end
-        
-        while d > days_in_month[m] do
-            d = d - days_in_month[m]
-            m = m + 1
-        end
-        
+
+        local y, m, d = unix_to_ymd(unix_seconds)
         return y, m, d, hours, mins, secs
     end
-    
-    -- GPS时间不可用，使用RTC或boot时间
-    -- 尝试使用rtc:gmtime()
-    local ok, rtc_time = pcall(rtc.get, rtc)
-    if ok and rtc_time then
-        return rtc_time:year(), rtc_time:month(), rtc_time:day(),
-               rtc_time:hour(), rtc_time:min(), rtc_time:sec()
+
+    -- GPS时间不可用，使用RTC
+    local utc = rtc:get_utc_time()
+    if utc and utc > 1000000000 then  -- 2001年之后才有效
+        local remaining = utc % 86400
+        local hours = math.floor(remaining / 3600)
+        remaining = remaining % 3600
+        local mins = math.floor(remaining / 60)
+        local secs = remaining % 60
+        local y, m, d = unix_to_ymd(utc)
+        return y, m, d, hours, mins, secs
     end
-    
-    -- 最后使用boot时间 (简化处理)
+
+    -- 最后fallback: boot时间 (简化处理)
     local boot_secs = math.floor(millis() / 1000)
     local hours = math.floor(boot_secs / 3600) % 24
     local mins = math.floor(boot_secs / 60) % 60
     local secs = boot_secs % 60
-    return 2024, 1, 1, hours, mins, secs
+    return 2025, 1, 1, hours, mins, secs
 end
 
 local function get_log_filename()
@@ -354,7 +387,7 @@ local function open_log_file()
     if not LOG_ENABLED then return false end
     
     local filename = get_log_filename()
-    local filepath = '/APM/LOG/' .. filename
+    local filepath = '/APM/LOGS/' .. filename
     
     -- 检查是否需要创建新文件
     if current_log_date ~= filename then
@@ -388,29 +421,22 @@ local function write_log_entry()
     if not open_log_file() then return end
     if not log_file then return end
     
+    -- AHRS/EKF 位置：GPS有效时为融合位置，丢星时为IMU惯导推算位置
+    local loc = ahrs:get_position()
+    local lat = loc and loc:lat() or 0
+    local lon = loc and loc:lng() or 0
+    
     -- 构建数据行
     local values = {}
     for _, col_name in ipairs(ALL_COLUMNS) do
         if col_name == 'time' then
-            -- 时间: 使用UTC时间 HH:MM:SS格式
             local y, m, d, h, min, s = get_utc_time()
             values[#values + 1] = string.format('%02d:%02d:%02d', h, min, s)
         elseif col_name == 'lat' then
-            local loc = ahrs:get_position()
-            if loc then
-                values[#values + 1] = string.format('%.7f', loc:lat())
-            else
-                values[#values + 1] = '0.0000000'
-            end
+            values[#values + 1] = string.format('%.7f', lat)
         elseif col_name == 'lon' then
-            local loc = ahrs:get_position()
-            if loc then
-                values[#values + 1] = string.format('%.7f', loc:lng())
-            else
-                values[#values + 1] = '0.0000000'
-            end
+            values[#values + 1] = string.format('%.7f', lon)
         else
-            -- 水质参数
             local val = current_data[col_name]
             if val then
                 values[#values + 1] = string.format('%.2f', val)
@@ -605,11 +631,22 @@ function update()
         end
     end
 
-    -- SD卡日志记录 (每2秒)
+    -- SD卡日志记录 (每2秒，GPS防抖动：短暂丢星不中断)
     if LOG_ENABLED and (millis() - last_log_time >= LOG_INTERVAL_MS) then
-        if next(current_data) then  -- 有数据才记录
-            write_log_entry()
-            last_log_time = millis()
+        if gps_log_ok() then
+            if not gps_was_locked then
+                gcs:send_text(6, 'WQ: GPS已锁定，开始记录日志')
+                gps_was_locked = true
+            end
+            if next(current_data) then  -- 有数据才记录
+                write_log_entry()
+                last_log_time = millis()
+            end
+        else
+            if gps_was_locked then
+                gcs:send_text(4, 'WQ: GPS信号丢失超过10秒，暂停日志记录')
+                gps_was_locked = false
+            end
         end
     end
 

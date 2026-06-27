@@ -1,7 +1,22 @@
 local PARAM_TABLE_KEY    = 26
 local PARAM_TABLE_PREFIX = "WQ_"
-local port               = serial:find_serial(0)
-assert(port, 'No scripting serial port found!')
+
+gcs:send_text(6, 'WQ: 脚本已加载 (v2.0)')
+
+-- 串口延后初始化（启动时硬件可能未就绪）
+local port = nil
+local function init_port()
+    if port then return port end
+    port = serial:find_serial(0)
+    if not port then
+        gcs:send_text(3, 'WQ: 未找到Scripting串口！检查SERIALx_PROTOCOL=28')
+        return nil
+    end
+    port:begin(uint32_t(SENSOR_BAUD))
+    port:set_flow_control(0)
+    gcs:send_text(6, 'WQ: 串口已就绪')
+    return port
+end
 
 -- ============================================
 -- 参数化配置
@@ -33,8 +48,7 @@ local SEND_INTERVAL_MS = param:get(PARAM_TABLE_PREFIX .. 'INTERVAL')
 local SENSOR_TIMEOUT   = param:get(PARAM_TABLE_PREFIX .. 'TIMEOUT')
 local LOG_ENABLED      = param:get(PARAM_TABLE_PREFIX .. 'LOG_EN') > 0
 
-port:begin(uint32_t(SENSOR_BAUD))
-port:set_flow_control(0)
+-- 串口配置在init_port()中完成
 
 -- ============================================
 -- 传感器定义
@@ -603,6 +617,11 @@ end
 -- 主循环
 -- ============================================
 function update()
+    -- 首次运行时初始化串口
+    local p = init_port()
+    if not p then return update, run_interval_ms end
+    port = p
+    
     local read_buffer = {}
     local bytes_read = 0
 

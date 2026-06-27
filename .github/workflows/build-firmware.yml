@@ -2,7 +2,7 @@ name: Build Firmware (MicoAir743v2 + Scripting)
 
 on:
   push:
-    branches: [main, master]
+    branches: [master]
   workflow_dispatch:   # 允许手动触发
 
 jobs:

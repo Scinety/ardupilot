@@ -335,6 +335,16 @@ local function unix_to_ymd(unix_seconds)
     return y, m, d
 end
 
+-- 将原始坐标(1e-7度整数)格式化为小数度，避开float32精度限制
+local function lat_str(raw)
+    local r = _n(raw)
+    return string.format('%d.%07d', _n(r // 10000000), _n(r % 10000000))
+end
+local function lon_str(raw)
+    local r = _n(raw)
+    return string.format('%d.%07d', _n(r // 10000000), _n(r % 10000000))
+end
+
 local function get_utc_time()
     -- 尝试从GPS获取UTC时间
     -- 注意: GPS周计数器每1024周(约19.7年)溢出一次，最近一次是2019年4月。
@@ -421,10 +431,12 @@ local function write_log_entry()
     if not open_log_file() then return end
     if not log_file then return end
     
-    -- AHRS/EKF 位置：GPS有效时为融合位置，丢星时为IMU惯导推算位置
+    -- AHRS/EKF 位置：用原始整数拼接，避开float32精度限制
     local loc = ahrs:get_position()
-    local lat = loc and loc:lat() / 10000000.0 or 0  -- 原始值单位1e-7度
-    local lon = loc and loc:lng() / 10000000.0 or 0
+    local raw_lat = loc and _n(loc:lat()) or 0
+    local raw_lon = loc and _n(loc:lng()) or 0
+    local lat = lat_str(raw_lat)
+    local lon = lon_str(raw_lon)
     
     -- 构建数据行
     local values = {}
@@ -433,9 +445,9 @@ local function write_log_entry()
             local y, m, d, h, min, s = get_utc_time()
             values[#values + 1] = string.format('%02d:%02d:%02d', _n(h), _n(min), _n(s))
         elseif col_name == 'lat' then
-            values[#values + 1] = string.format('%.8f', _n(lat))
+            values[#values + 1] = lat  -- 已是格式化字符串
         elseif col_name == 'lon' then
-            values[#values + 1] = string.format('%.8f', _n(lon))
+            values[#values + 1] = lon
         else
             local val = current_data[col_name]
             if val then
@@ -639,8 +651,10 @@ function update()
                 gcs:send_text(6, 'WQ: GPS已锁定，开始记录日志')
                 gps_was_locked = true
             end
-            write_log_entry()  -- 临时去掉数据检查，纯GPS测试
-            last_log_time = millis()
+            if next(current_data) then  -- 有数据才记录（传感器在线时）
+                write_log_entry()
+                last_log_time = millis()
+            end
         else
             if gps_was_locked then
                 gcs:send_text(4, 'WQ: GPS信号丢失超过10秒，暂停日志记录')

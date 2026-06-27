@@ -1,8 +1,6 @@
 local PARAM_TABLE_KEY    = 26
 local PARAM_TABLE_PREFIX = "WQ_"
 
-gcs:send_text(6, 'WQ: 脚本已加载 (v2.0)')
-
 -- 串口延后初始化（启动时硬件可能未就绪）
 local port = nil
 local function init_port()

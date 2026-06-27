@@ -11,21 +11,21 @@ local function add_param(name, idx, default_value)
         string.format("WQ: could not add param %s", name))
 end
 
-assert(param:add_table(PARAM_TABLE_KEY, PARAM_TABLE_PREFIX, 30), "WQ: could not add param table")
+assert(param:add_table(PARAM_TABLE_KEY, PARAM_TABLE_PREFIX, 31), "WQ: could not add param table")
 
--- 基本参数
-add_param('BAUD',     0, 9600)
-add_param('INTERVAL', 1, 2000)
-add_param('TIMEOUT',  2, 5000)
-add_param('LOG_EN',   3, 1)      -- 启用SD卡日志
+-- 基本参数 (索引1-10，ArduPilot参数表从1开始)
+add_param('BAUD',     1, 9600)
+add_param('INTERVAL', 2, 2000)
+add_param('TIMEOUT',  3, 5000)
+add_param('LOG_EN',   4, 1)      -- 启用SD卡日志
 
 -- 报警阈值参数
-add_param('PH_MIN',   4, 6.0)
-add_param('PH_MAX',   5, 9.0)
-add_param('DO_MIN',   6, 5.0)
-add_param('TEMP_MAX', 7, 40.0)
-add_param('NTU_MAX',  8, 500.0)
-add_param('NH3_MAX',  9, 1.5)
+add_param('PH_MIN',   5, 6.0)
+add_param('PH_MAX',   6, 9.0)
+add_param('DO_MIN',   7, 5.0)
+add_param('TEMP_MAX', 8, 40.0)
+add_param('NTU_MAX',  9, 500.0)
+add_param('NH3_MAX',  10, 1.5)
 
 -- 读取配置
 local SENSOR_BAUD      = param:get(PARAM_TABLE_PREFIX .. 'BAUD')
@@ -304,8 +304,11 @@ end
 -- ============================================
 
 -- 从unix时间戳转换到年月日 (1970-01-01起算的天数)
+-- uint32_t → Lua数字转换 (ArduPilot Lua中+0.0/tonumber都无效, 必须走tostring)
+local function _n(val) return tonumber(tostring(val)) end
+
 local function unix_to_ymd(unix_seconds)
-    local days = math.floor(unix_seconds / 86400)
+    local days = _n(unix_seconds) // 86400
     local y = 1970
     local m = 1
     local d = days + 1  -- 从1开始
@@ -336,8 +339,8 @@ local function get_utc_time()
     -- 尝试从GPS获取UTC时间
     -- 注意: GPS周计数器每1024周(约19.7年)溢出一次，最近一次是2019年4月。
     -- 当前周期到2038年底前都有效。
-    local week = gps:time_week()
-    local week_ms = gps:time_week_ms()
+    local week = _n(gps:time_week(0))
+    local week_ms = _n(gps:time_week_ms(0))
 
     if week > 0 and week_ms > 0 then
         -- GPS时间可用，转换为UTC
@@ -347,39 +350,36 @@ local function get_utc_time()
         local unix_seconds = gps_seconds + 315964800
 
         local remaining = unix_seconds % 86400
-        local hours = math.floor(remaining / 3600)
+        local hours = remaining // 3600        -- 整数除法，替代math.floor
         remaining = remaining % 3600
-        local mins = math.floor(remaining / 60)
+        local mins = remaining // 60
         local secs = remaining % 60
 
         local y, m, d = unix_to_ymd(unix_seconds)
         return y, m, d, hours, mins, secs
     end
 
-    -- GPS时间不可用，使用RTC
-    local utc = rtc:get_utc_time()
-    if utc and utc > 1000000000 then  -- 2001年之后才有效
+    -- GPS时间不可用，使用RTC（如果可用）
+    local ok, utc = pcall(function() return rtc:get_utc_time() end)
+    if ok and utc and utc > 1000000000 then
         local remaining = utc % 86400
-        local hours = math.floor(remaining / 3600)
+        local hours = remaining // 3600
         remaining = remaining % 3600
-        local mins = math.floor(remaining / 60)
+        local mins = remaining // 60
         local secs = remaining % 60
         local y, m, d = unix_to_ymd(utc)
         return y, m, d, hours, mins, secs
     end
 
-    -- 最后fallback: boot时间 (简化处理)
-    local boot_secs = math.floor(millis() / 1000)
-    local hours = math.floor(boot_secs / 3600) % 24
-    local mins = math.floor(boot_secs / 60) % 60
-    local secs = boot_secs % 60
-    return 2025, 1, 1, hours, mins, secs
+    -- GPS和RTC都不可用，返回当前系统时间（仅GPS无效时触发）
+    return 2025, 6, 27, 0, 0, 0
 end
 
 local function get_log_filename()
     local y, m, d, h, min, s = get_utc_time()
     -- 格式: YYMMDDHHMM.txt (每分钟一个文件)
-    local filename = string.format("WQ%02d%02d%02d%02d%02d.txt", y % 100, m, d, h, min)
+    local filename = string.format("WQ%02d%02d%02d%02d%02d.txt",
+        _n(y % 100), _n(m), _n(d), _n(h), _n(min))
     return filename
 end
 
@@ -423,19 +423,19 @@ local function write_log_entry()
     
     -- AHRS/EKF 位置：GPS有效时为融合位置，丢星时为IMU惯导推算位置
     local loc = ahrs:get_position()
-    local lat = loc and loc:lat() or 0
-    local lon = loc and loc:lng() or 0
+    local lat = loc and loc:lat() / 10000000.0 or 0  -- 原始值单位1e-7度
+    local lon = loc and loc:lng() / 10000000.0 or 0
     
     -- 构建数据行
     local values = {}
     for _, col_name in ipairs(ALL_COLUMNS) do
         if col_name == 'time' then
             local y, m, d, h, min, s = get_utc_time()
-            values[#values + 1] = string.format('%02d:%02d:%02d', h, min, s)
+            values[#values + 1] = string.format('%02d:%02d:%02d', _n(h), _n(min), _n(s))
         elseif col_name == 'lat' then
-            values[#values + 1] = string.format('%.7f', lat)
+            values[#values + 1] = string.format('%.8f', _n(lat))
         elseif col_name == 'lon' then
-            values[#values + 1] = string.format('%.7f', lon)
+            values[#values + 1] = string.format('%.8f', _n(lon))
         else
             local val = current_data[col_name]
             if val then
@@ -536,8 +536,9 @@ end
 -- ============================================
 -- 注册启用参数
 -- ============================================
+-- 传感器启用参数 (idx+10 避免和基础参数1-10冲突)
 for idx, sensor in pairs(SENSORS) do
-    add_param(sensor .. '_ENABLE', idx, 0)
+    add_param(sensor .. '_ENABLE', idx + 10, 0)
 end
 
 local enabled_commands = {}
@@ -638,10 +639,8 @@ function update()
                 gcs:send_text(6, 'WQ: GPS已锁定，开始记录日志')
                 gps_was_locked = true
             end
-            if next(current_data) then  -- 有数据才记录
-                write_log_entry()
-                last_log_time = millis()
-            end
+            write_log_entry()  -- 临时去掉数据检查，纯GPS测试
+            last_log_time = millis()
         else
             if gps_was_locked then
                 gcs:send_text(4, 'WQ: GPS信号丢失超过10秒，暂停日志记录')
